@@ -1,0 +1,735 @@
+---
+title: "Modeling the 2016 Election using Logistic Regression"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+**By John Clements**
+
+The outcome of the 2016 presidential election was surprising to many people, particularly to those not familiar with historical polling error sizes. In order to determine some of the underlying factors influencing voting patterns, I downloaded the 2015 5-year estimates American Community Survey (the ACS is a survey of American households administered by the Census Bureau) from the Census Bureau website and aggregated it up from the Census Tract (sub-county geographical units defined by the Census Bureau) level to the county and state level. I chose the 2015 ACS, as opposed to the 2016 ACS because it is information that was available prior to the election, while the 2016 ACS wouldn't have been available at the time of the election. I then got election data at the county level from https://cutt.ly/YTCa9x and at the state level from the MIT Election Data and Science Lab. I used *vlookup* in Excel to quickly add in a 'state' column to the county level election results before loading into this notebook for my formatting purposes. I then merged them together and did some exploratory analysis using Principal Component Analysis and K-means clustering to see if any interesting groupings of states appeared. Following some exploratory analysis, I used logistic regression utilizing forwards and backwards step-wise variable selection to eliminate unimportant variables. I decided on logistic regression as opposed to other classification techniques because of it's interpretable and after estimating the models I investigated the relationships between the independent variables and electoral outcomes. The coefficients of the models are consistent with Clinton performing better in less white areas, urban areas, and areas with higher per capita incomes, as well as areas with higher poverty rates.
+
+
+# **I. Creating the State and County Level Data Sets**
+
+It would be nice if data sets were ready for exploration and modeling as soon as they're downloaded, but unfortunately they often need to be reformatted and cleaned before the fun can begin. This is what I do in this section.
+
+## **A. Getting the Demographic Data from the 2015 American Community Survey**
+
+First, the 2015 American Community Survey needs to be loaded in. There are 74,001 rows (Census Tracts) and 37 columns for variables on demographic, economic, and other types of data.
+
+```{r}
+# loads the dplyr library for data manipulation
+library(dplyr)
+# reads in the 2015 American Community Survey .csv file
+acs = read.csv('./acs2015_census_tract_data.csv')
+
+# prints out the dimensions of the 2015 ACS and it shows there are 74001 rows and 37 columns
+dim(acs)
+
+# prints out the column names of the acs
+names(acs)
+
+# prints out the first 5 entries showing that lots of the variables are in percentages and need
+# to be converted to absolute numbers before aggregating up to the county and state level
+head(acs, n = 3)
+```
+
+After checking for missing values, I found there are numerous missing values that need to be filled in.
+
+```{r}
+# creates a single variable for the State and County names for easy grouping since County names
+# can repeat in multiple states
+acs$StateCounty = with(acs, paste0(State, '_', County))
+
+# prints the number of missing values in each column
+for (var in colnames(acs)){
+    if (sum(is.na(acs[[var]])) > 0) print(paste(var, sum(is.na(acs[[var]]))))
+}
+```
+
+It appeared there are some Census Tracts with no data at all, which was especially a problem in Puerto Rico. Other missing observations seemed to be in rows with plenty of other information.
+
+```{r}
+# creates a dataframe of the rows with missing values in any column
+missing_data <- acs[rowSums(is.na(acs)) > 0,]
+# prints out the first and last 6 rows with missing values to get an idea of the missing values
+head(missing_data)
+tail(missing_data)
+```
+
+Since Puerto Rico lacks electoral votes I excluded it from my analysis, dropping some missing observations. I also dropped Census Tracts where the population is 0 because they appear to have only empty columns. There were still missing observations to be dealt with after dropping the empty rows, so I chose to impute them.
+
+```{r}
+# removes Puerto Rico and Census Tracts with empty total populations from acs in a new
+# dataframe
+fill_acs = acs[!(acs$State == 'Puerto Rico' | acs$TotalPop == 0),]
+# drops the CensusTract because it isn't important to the analysis
+fill_acs = fill_acs %>%
+    select(-CensusTract)
+# prints the number of missing values in each column
+for (var in colnames(fill_acs)){
+    if (sum(is.na(fill_acs[[var]])) > 0) print(paste(var, sum(is.na(fill_acs[[var]]))))
+}
+```
+
+I decided to impute missing observations with the mean value in the column within the same county, since there are multiple Census Tracts within a county. This is under the assumption that areas within a county are more similar to each other than the state or total US level. However, after this process, there are still 3 missing values; one in 'Income', 'IncomeErr', and 'ChildPoverty'.
+
+```{r}
+# this loops through the numeric columns in fill_acs and then loops through the rows with
+# missing values and then imputes the missing values with the mean for the subset of rows in
+# in the same StateCounty subset
+for (i in which(sapply(fill_acs, is.numeric))) {
+    for (j in which(is.na(fill_acs[, i]))) {
+        # sets the missing value at row j and in column i to the mean of the non-missing values
+        # in column i that are in the same county in the same state
+        fill_acs[j, i] = mean(
+            fill_acs[fill_acs[, 'StateCounty'] ==  fill_acs[j, 'StateCounty'], i], na.rm = TRUE)
+    }
+}
+
+# prints the number of missing values in each column
+for (var in colnames(fill_acs)){
+    if (sum(is.na(fill_acs[[var]])) > 0) print(paste(var, sum(is.na(fill_acs[[var]]))))
+}
+```
+
+I used the state averages for the last 3 missing values.
+
+Some of the variables were in percentage terms, which would have made aggregating up from the Census Tract level difficult. To fix this, I translated the percentages to proportions, and multiplied them by the total population of the Census Tract, then rounded to the nearest integer (you can't have fractions of a person). I got a total income for the Census Tracts by multiplying the per capita income by the total population of the Census Tract and did the same for the commute time variable. This allowed all the variables to be summed up giving the total number of persons in a given demographic, professional, etc. group and the total income and commute time at the state and county levels. These variables were then divided by the population at the state or county level, so they became proportions, income per capita, and average commute time per person at the state and county levels.
+
+```{r}
+# does the same thing as the other loop but it sets the missing values to the state average
+# because these entries with missing values likely have no other observations in the same
+# county
+for (i in c('Income', 'IncomeErr', 'ChildPoverty')) {
+    for (j in which(is.na(fill_acs[, i]))) {
+        fill_acs[j, i] = mean(fill_acs[fill_acs[, 'State'] ==  fill_acs[j, 'State'], i],  
+                              na.rm = TRUE)
+    }
+}
+
+# prints the number of missing values in each column if there are any
+for (var in colnames(fill_acs)){
+    if (sum(is.na(fill_acs[[var]])) > 0) print(paste(var, sum(is.na(fill_acs[[var]]))))
+}
+
+# creates a list containing the soon to be redundant income variables and which will be
+# appended with variables to drop
+vars_to_drop = c('Income', 'IncomeErr', 'IncomePerCap', 'IncomePerCapErr');
+
+# this loop goes through variables that are in percentage terms and then turns them to absolute
+# numbers for later aggregation up to the county and state level
+for (var in c('Hispanic', 'White', 'Black', 'Native', 'Asian', 'Pacific', 'Poverty',
+       'ChildPoverty', 'Professional', 'Service', 'Office', 'Construction',
+       'Production', 'Drive', 'Carpool', 'Transit', 'Walk', 'OtherTransp',
+       'WorkAtHome', 'PrivateWork', 'PublicWork', 'SelfEmployed', 'FamilyWork', 
+        'Unemployment')){
+    # creates a new column from the old variable that turns the percentage into a proportion
+    # then multiplies by the number of people in the census tract and then rounds that to the
+    # nearest whole number because you cannot have fractions of a person
+    fill_acs[[paste0(var,'_')]] = round((fill_acs[[var]] / 100) * fill_acs$TotalPop)
+    # adds the old variable to the list to drop after the new variables are created
+    vars_to_drop = c(vars_to_drop, var)    
+} 
+
+# creates a variable that when the state and county level aggregation occurs and each 
+# variable is divided by TotalPop will provide per capita income
+fill_acs$income_weighted = fill_acs$IncomePerCap * fill_acs$TotalPop
+
+# creates a variable that when the state and county level aggregation occurs and each 
+# variable is divided by TotalPop will provide per capita income
+fill_acs$MeanCommute = fill_acs$MeanCommute * fill_acs$TotalPop
+
+# drops the redundant variables
+fill_acs = fill_acs[ , !(names(fill_acs) %in% vars_to_drop)]
+
+head(fill_acs)
+```
+
+
+```{r}
+# creates a variable that has the state level data by summing each variable at that level
+X_state = fill_acs %>%
+    select(-County) %>%
+        select(-StateCounty) %>%
+            group_by(State) %>%
+                summarise_each(funs(sum))
+
+# looks at the first and last 3 rows to check the appearance of the data
+head(X_state, n = 3)
+tail(X_state, n = 3)
+# checks the dimensions (we expect 51 rows for 50 states and 1 for DC)
+dim(X_state)
+```
+
+
+```{r}
+# creates a variable that has the county level data by summing each variable at that level
+X_county = fill_acs %>%
+    select(-County) %>%
+        select(-State) %>%
+            group_by(StateCounty) %>%
+                summarise_each(funs(sum))
+
+# looks at the first and last 3 rows to check the appearance of the data
+head(X_county, n = 3)
+tail(X_county, n = 3)
+# checks the dimensions (we expect 3142 rows for 3007 counties, 64 parrishes, 19 organized
+# boroughs, 10 census areas, 41 independent cities, and the District of Columbia)
+dim(X_county)
+```
+
+The variables in the state and county levels can be summarized to give some descriptive statistics, but there are 31 variables. Analyzing each of these individually is difficult and an entire project can be made of focusing in on a couple variables at a time. Later, Principal Component Analysis and K-means clustering are used to explore the data sets.
+
+```{r}
+# these two loops divide all numeric variables, excluding TotalPop, by TotalPop so they are now
+# all now proportions of the total population, except for MeanCommute and income_weighted;
+# MeanCommute is now the mean commute time at the new aggregated level and income_weighted
+# is the income per person in the new aggregated level
+for (i in 3:length(colnames(X_state))) {
+    X_state[, i] = X_state[, i] / X_state$TotalPop
+}
+for (i in 3:length(colnames(X_county))) {
+    X_county[, i] = X_county[, i] / X_county$TotalPop
+}
+
+summary(X_state)
+```
+
+
+```{r}
+summary(X_county)
+```
+
+## **B.  Getting the 2016 Presidential Election Data**
+### **i. Merging State Level Data with Voting Data**
+
+Wrangling the state level electoral data was a much easier process. All that needed to be done is to filter the data set to only include the year 2016, then group the number of votes for each candidate in each state. I say candidate and not party because some candidates were on the ticket for multiple parties (like Secretary Clinton in NY who was on the Democratic and Working Families ticket). Then I created a binary variable for if Clinton won the state or not (TRUE if she did and FALSE if she did not) and attached this dataframe to the state level data from the American Community Survey.
+
+```{r}
+# reads in a .csv of presidential election data going back to 1976 
+# (source: https://electionlab.mit.edu/data)
+state_votes = read.csv('./1976-2016-president.csv')
+
+tail(state_votes, n = 10)
+```
+
+
+```{r}
+# creates a percentage of votes won by the total votes for every row
+state_votes$per_vote = state_votes$candidatevotes / state_votes$totalvotes
+
+# creates a dataframe filtering out all non-2016 elections, grouping by state and 
+# candidate because some candidates were the nominee for multiple parties 
+# (like Clinton in New York for the Democratic and Working Famalies Party)
+all_candidates = state_votes %>%
+        filter(year == 2016) %>%
+            group_by(state, candidate) %>%
+                summarise_at(c('per_vote'), sum)
+
+# creates a dataframe holding Clinton's percentage of the total vote in each state and DC
+clinton_votes = all_candidates %>%
+    group_by(state) %>%
+        filter(candidate == 'Clinton, Hillary') %>%
+            mutate(clinton_per = per_vote) %>%
+                select(state, clinton_per)
+
+# creates a dataframe holding Clinton's percentage of the total vote in each state and DC                       
+trump_votes = all_candidates %>%
+    group_by(state) %>%
+        filter(candidate == 'Trump, Donald J.') %>%
+            mutate(trump_per = per_vote) %>%
+                select(state, trump_per)
+
+# joins the two dataframes so each row is a state with Clinton and Trump's vote shares
+y_state = merge(x = clinton_votes, 
+               y = trump_votes, 
+               by = 'state', 
+               all = F)
+
+# renames the state column as State to make the join with the other state level data set
+# easier
+colnames(y_state)[1] <- 'State'
+
+# creates a dummy variable for if Trump won the county
+y_state$clinton_win = y_state$clinton_per > y_state$trump_per
+
+# joins the two dataframes so each row is a state with Clinton and Trump's vote shares
+state = merge(x = X_state, 
+               y = y_state, 
+               by = 'State', 
+               all = F)
+
+head(state)
+```
+
+### **ii. Merging County Level Data**
+
+Next I got electoral data at the county level courtesy of Tim McGovern's (https://twitter.com/tonmcg) github. Unfortunately, the data for Alaska is just the state level data repeated so I didn't have the boroughs of Alaska in the complete data set. 
+
+```{r}
+# reads in county level presidential election results
+y_county = read.csv('./2016_US_County_Level_Presidential_Results.csv')
+
+# gives us a sense of the dataframe
+dim(y_county)
+head(y_county, n = 3)
+tail(y_county, n = 3)
+```
+
+I lost a couple rows on the inner join, including all of Alaska, but still proceeded with the county level analysis because I still had 3046 observations of the starting 3146 in the American Community Survey at the counties, parishes, boroughs, etc. level. I again created a binary response variable for whether Clinton won a state or not. I then moved on to exploratory analysis.
+
+```{r}
+# brings in the str_remove() function to easily strip ' County' from the county_name column
+library(stringr)
+# defines a function to take ' County' out of the county_name column
+minus_county = function(x) str_remove(x, ' County')
+# takes out ' County' from the county_name column
+y_county$county_name = minus_county(y_county$county_name)
+# creates a StateCounty variable to join this data set with the county level acs data
+y_county$StateCounty = with(y_county, paste0(state, '_', county_name))
+# creates a dummy variable for if Trump won the county
+y_county$clinton_win = y_county$per_gop < y_county$per_dem
+# takes only the variables that we are interested in predicting
+y_county = y_county[,c('per_dem', 'per_gop', 'clinton_win', 'StateCounty')]
+
+# joins the two county level data sets on the StateCounty variable and omits any rows
+# without a match in the other dataframe
+county = merge(x = X_county, 
+               y = y_county, 
+               by = 'StateCounty', 
+               all = F)
+
+head(county)
+```
+
+
+```{r}
+dim(county)
+```
+
+# **II. Exploratory Data Analysis using Unsupervised Learning**
+
+## **A. Initial Exploration and Removing Highly Correlated Features**
+
+Some of the features in the ACS are linear combinations of each other (like Men and Women) or are likely to be highly correlated with each other (like Poverty and ChildPoverty). I removed these variables before proceeding further with analysis.
+
+```{r}
+# creates new dataframes for the independent and dependent variables now that some rows have
+# been eliminated during the join process
+X_state = state %>%
+    select(-c('clinton_per', 'trump_per', 'clinton_win'))
+X_county = county %>%
+    select(-c('per_dem', 'per_gop', 'clinton_win'))
+y_state = state %>%
+    select(c('clinton_per', 'trump_per', 'clinton_win'))
+y_county = county %>%
+    select(c('per_dem', 'per_gop', 'clinton_win'))
+```
+
+### **i. State Level**
+
+The ACS has too many features to produce a full correlogram, so I broke the variables up into 3 groups to visualize some of the correlations, although that does not allow for all possible correlations correlations to be seen.
+
+In the first correlogram, it is obvious that the proportion of men and women have a strong inverse correlation. This makes sense because there is only 100% of people in an area. An increase of 1% in one sex means the percentage of the other sex must decrease by 1%. 
+
+```{r}
+plot(X_state[,2:13], col='blue')
+```
+
+In the next correlogram, it is obvious that Poverty and ChildPoverty are highly positively correlated. This also is intuitive because the children of parents in poverty will be in poverty as well.
+
+```{r}
+plot(X_state[,14:21], col='blue')
+```
+
+No super strong correlations pop out in the last correlogram, except possibly a negative correlation between the proportion of people in the private versus public sector. That does not mean that there are no other strong correlations in the data set, because the correlogram for the entire data set was too large to visualize.
+
+```{r}
+plot(X_state[,22:32], col='blue')
+```
+
+Using a function to identify highly correlated (|correlation| > 0.9) features for removal, identified 2 features we identified visually for removal (Men, Poverty), as well 2 other redundant variables we did not identify (Carpool and WorkAtHome). After removing the redundant variables and recalculating the correlations, Drive and OtherTransp were identified as redundant due to strong correlations with other variables, so they were removed as well.
+
+```{r}
+# imports caret to identify corrleated features
+library(caret)
+
+# finds correlated features with threshold 0.9
+state_correlated_features = findCorrelation(cor(X_state[,-1]), cutoff = 0.9, exact = T)
+
+while (is.null(colnames(X_state[,state_correlated_features])) == F) {
+  # finds correlated features with threshold 0.9
+  state_correlated_features = findCorrelation(cor(X_state[,-1]), cutoff = 0.9, exact = T)
+  # prints the name of correlated features
+  print(colnames(X_state[,state_correlated_features]))
+  # removes the highly correlated variables
+  X_state = X_state[,-state_correlated_features]
+}
+```
+
+### **ii. County Level**
+
+Instead of repeating the correlograms at the county level, I just removed the redundant features with correlations greater than or equal to 0.9 in magnitude, which was Men and Poverty again. Now that redundant variables were removed from the data sets, I moved on to exploratory analysis.
+
+```{r}
+# finds correlated features with threshold 0.85
+county_correlated_features = findCorrelation(cor(X_county[,-1]), cutoff = 0.9, exact = T)
+
+# prints the name of correlated features
+colnames(X_county[,county_correlated_features])
+```
+
+```{r}
+# removes the highly correlated variables
+X_county = X_county[,-county_correlated_features]
+```
+
+## **B. Principal Component Analysis and K-means Clustering**
+
+I used k-means clustering to identify which states are similar to each other based on the remaining features contained in the ACS. The issue was there are 24 independent variables for the state level and 29 for the county level, which is where the curse of dimensionality reared its head. In 24-dimensional space (or 29-dimensional space) similar data points can be very far apart. For that reason, I used Principal Components Analysis to reduce the number of dimensions for which clustering was performed on.
+
+### **i. State Level Analysis**
+
+Performing Principal Component Analysis on the state level independent variables showed about 79.4% of the variance in the independent variables is explained by the first 5 principal components. The fifth principal component is also the last principal component that explains more than 5% of the variance in the independent variables. I used that as an arbitrary cutting off point because I didn't want to greatly exceed 4 dimensions for clustering.
+
+```{r}
+# performs principal component analysis on the the independent variables and scales them all to have mean 0 and standard deviation 1
+pc.state.full = prcomp(X_state[, -1], scale = T)
+# creates a variable that stores the percentage of variance explained by each principal component
+pve.state.full = 100 * pc.state.full$sdev ^ 2 / sum(pc.state.full$sdev ^ 2)
+
+summary(pc.state.full)
+```
+
+This Scree Plot visualizes the proportion of variance explained by each principal component. After the 5th one, the plot starts to bottom out in terms of the proportion of variance explained by the components.
+
+```{r}
+# produces a scree plot for the state level data
+plot(pve.state.full, type='o', main='State Level Scree Plot', 
+     ylab='Percentage of Variance Explained', xlab='Principal Component', col='blue')
+```
+
+This cumulative proportion of variance explained plot just illustrates that the cumulative percentage of variance explained is about 80% around the 5th principal component.
+
+```{r}
+# plots the cumulative percentage of variance explained by the principal components 
+plot(cumsum(pve.state.full), type='o', main='State Level Cumulative Percentage of Variance Explained', 
+     ylab='Cumulative % of Variance Explained', xlab='Principal Component', col='blue')
+```
+
+This plot shows the 1st and 2nd principal components plotted against each other with blue dots for Clinton wins and red dots for Trump wins. It looks like the observations are fairly well separated by the first 2 principal components.
+
+```{r}
+# this is a function I got from the ISLR textbook to produce colors in plots for the target variable
+
+# takes in a vector as an argument
+Cols=function(vec){
+  # uses the rainbow function to make a color for each unique value in the input vector and returns it
+  cols = rainbow(length(unique(vec))) 
+  return(cols[as.numeric(as.factor(vec))]) 
+}
+
+
+# plots the 2 most important principal components against each other and assigns colors to the data points based on whether they voted for Clinton (Blue) or Trump (red)
+plot(pc.state.full$x[,1:2], col=Cols(y_state$clinton_win), pch=19, xlab="Z1",ylab="Z2")
+```
+
+Next, I performed k-means clustering on the first 5 principal components with 2 to 10 clusters. I decided I liked the breakdown of the 10 cluster table the best because it allowed for small and large clusters, with most clusters containing 5 to 8 states. There are 3 single state clusters, 2 of which I expected to be Washington, DC (due to being 100% urban, with very high incomes, and high inequality one would expect it to be different from other states) and Hawaii (much larger Asian American and Pacific Islander population proportion than any other state and a much smaller proportion of white people). I decided not to try additional clusters because I did not want to create too small of clusters.
+
+```{r}
+# performs k-means clustering on the first 7 principal components with 2, 3, 4, and 5 clusters and prints out the result to compare the number of observations in each cluster with whether or not Trump or Clinton won there
+
+# loops from 2 to 10
+for (i in 2:10){
+  # sets a seed for random number generation to make the results reproducible
+  set.seed(1071)
+  # does the k-means clustering with 20 starts to find a decent final clustering
+  km.state.pca = kmeans(pc.state.full$x[,1:5], i, nstart = 20) 
+  # prints out a table of the clusters and the number of states in each one where Clinton won and lost
+  print(table(km.state.pca$cluster, y_state$clinton_win))
+}
+```
+
+Below is a visualization of the clusters and the difference between Clinton and Trump's vote share.
+
+```{r}
+# uses the same random seed as before
+set.seed(1071)
+# performs the k-means clustering with 10 clusters on the first 5 principal components with 50 starts
+km.state.pca = kmeans(pc.state.full$x[,1:5], 10, nstart = 50) 
+# creates a column in states to hold the cluster assignments
+state$kmean.clust = km.state.pca$cluster
+
+# plots each cluster on the x-axis and the differential between Clinton and Trump's vote share to visualize the distribution of votes in each cluster (blue does above the 0 tick mark are states that voted Clinton)
+plot(x = state$kmean.clust, y = state$clinton_per - state$trump_per, col = Cols(state$clinton_win), pch = 19)
+```
+
+The 1st cluster is the South. It seems to be the most similar cluster to what is considered to be the main regions of America (South, Southwest, Pacific Northwest, Mountain West, Great Plains, Upper Midwest, Mid-Atlantic, and New England). A notable exclusion is Virginia, which has seemed to join the Mid-Atlantic cluster.
+
+The 2nd cluster stretches from Missouri in the west and Pennsylvania and Delaware in the east. It also has most of the 'Rust Belt' (Ohio, Michigan, Pennsylvania, and Indiana) within the cluster. Rhode Island seems out of place to me though.
+
+Using 8 clusters, Alaska is most similar to the upper Great Plains region than any other cluster. This makes sense. All of those states are sparsely populated and have fairly high proportions of white people in their populations. There may be similarities in their economies as well. The upper Great Plains has a lot of ranching and Alaska has a robust fishing industry which may be coded the same for the purposes of the ACS. Alaska and North Dakota also have robust oil industries.
+
+The 4th cluster is interesting because it has 2 Clinton states (California and Nevada) and 3 Trump states (Texas, Florida, and Arizona), but it is easy to see how they are all connected. All of the states have very high Latinx populations and, excluding Florida, can be considered the Southwest. I would have expected New Mexico to be in this cluster as well, but using 10 clusters might have pulled it out.
+
+As expected, Hawaii and DC have their own clusters.
+
+The 7th cluster is interesting because it is made up of high GDP per capita states along the East Coast. Northern Virginia and Maryland are also where a lot of people who work in DC live, just as Connecticut and New Jersey have a fair amount of commuters to NYC.
+
+The 8th cluster is made of the Mountain West and Pacific Northwest. It also contains a portion of the Mid-West.
+
+New Mexico has its own cluster which surprised me as I expected it to be with other Southwestern states.
+
+The final cluster is composed of the 3 northernmost New England states,the Upper Midwest sans Michigan, and Iowa and Nebraska. The last 4 states form a contiguous region, just as the first 3 form a continuous group of land.
+
+```{r}
+for (i in seq(unique(state$kmean.clust))){
+  print(state %>%
+          filter(kmean.clust == i) %>%
+            select(State))
+}
+```
+
+This is far from the final word in grouping US states together based on their characteristics. You could find more data about the states and perform different clusterings, even excluding DC and Hawaii since they are oultliers in terms of some of their characteristics, but I do think there were some interesting takeaways from this analysis. First, regions in the US are still strong. There was a high degree of geographical continuity within clusters. Second, Virginia is now closer to the Mid-Atlantic area than the South. Third, Alaska is fairly similar to the upper Great Plains. Finally, Florida is closer to the Southwest than the South, however this is likely driven by the high Latinx population. There are currently large differences between the high number of Americans of Cuban and Venezuelan descent in Florida and Latinx from other backgrounds in the area from California to Texas. 
+
+### **ii. County Level**
+
+Compared to the state level, there is far more variability among counties than there was among states. It takes 11 principal components to explain the same amount of variance among counties as explained by 5 in the state data. Because of the high number of principal components required to explain more than 70% of the variance, I did not perform clustering on the counties.
+
+```{r}
+# performs principal component analysis on the the independent variables and scales them all to have mean 0 and standard deviation 1
+pc.county.full = prcomp(X_county[, -1], scale = T)
+# creates a variable that stores the percentage of variance explained by each principal component
+pve.county.full = 100 * pc.county.full$sdev ^ 2 / sum(pc.county.full$sdev ^ 2)
+
+summary(pc.county.full)
+```
+
+Below: Scree Plot
+
+```{r}
+# produces a scree plot for the County level
+plot(pve.county.full, type='o', main='County Level Scree Plot', 
+     ylab='Percentage of Variance Explained', xlab='Principal Component', col='blue')
+```
+
+The cumulative percentage of variance explained plot shows how slowly the cumulative percentage of variance explained approaches 1.
+
+```{r}
+# produces a plot of the cumulative percentage of variance explained
+plot(cumsum(pve.county.full), type='o', main='County Level Percentage Proportion of Variance Explained', 
+     ylab='Cumulative Percentage of Variance Explained', xlab='Principal Component', col='blue')
+```
+
+As you can see from the 1st vs 2nd principal components, the separation of Trump and Clinton counties isn't as clear as the separation using the first 2 principal components at the state level.
+
+```{r}
+# plots the 2 most important principal components and then color codes the data points based on election outcome
+plot(pc.county.full$x[,1:2], col=Cols(y_county$clinton_win), pch=19, xlab="Z1",ylab="Z2")
+```
+
+# **III. Classification using Logistic Regression**
+
+## **A. State Level**
+
+The US has 50 states and DC, so the state level data set has 51 observations. It also has 24 independent variables. That means there are only about 2 observations for every observation. This means there wasn't enough data to get reasonable standard errors of the coefficients and the statistical significance of each variable could not be determined.
+
+
+Below is the output from performing logistic regression on the state level data. All of the z-values are zero due to having too few observations relative to independent variables.
+
+```{r}
+# creates a variable for whether Clinton won a state or not
+state_clinton_win = y_state[,3]
+# combines the variable above with the independent variables at the state level
+state.class = cbind(state_clinton_win, X_state[,-1])
+# estimates a logistic regression model for the state level with all variables; warnings are suppressed because some states are probabilities are predicted to be 1 or 0, which is consistent with prior expectations (Clinton had essentially 0% chance of winning Alabama by my guess)
+suppressWarnings((log.state.full = glm(state_clinton_win~., family = 'binomial', data = state.class)))
+# summarizes the model
+summary(log.state.full)
+```
+
+Because the z-values of the coefficients in the full model are all practically 0, I decided forward step-wise variable selection was preferable to backwards variable selection. However, at the end of the process, none of the variables selected were statistically significant. Since variables were added sequentially and the number of variables was small, I manually added the independent variables to the model until they lost statistical significance in the order they were listed in the output from the forward selection method.
+
+```{r}
+# creates an empty model for forwards step-wise regression
+null.model <- glm(state_clinton_win ~ 1, family = 'binomial', data = state.class)
+# performs forward stepwise regression for variable selection; warnings are suppressed because some states are probabilities are predicted to be 1 or 0, which is consistent with prior expectations (Clinton had essentially 0% chance of winning Alabama by my guess)
+suppressWarnings((log.state.forwards = step(null.model, scope = list(lower=formula(null.model), upper = formula(log.state.full)), direction="forward", trace = 0)))
+summary(log.state.forwards)
+```
+
+This left just 2 statistically significant variables, both of which positively affected the probability a state voted for Clinton as they increased; the income per capita of the state and the proportion of workers employed in the service sector.
+
+```{r}
+# after some messing around, there are only 2 variables that remain statistically significant and this is the model including them
+log.state.mixed = glm(state_clinton_win ~ income_weighted + Service_, family = 'binomial', data = state.class)
+# summarizes the model
+summary(log.state.mixed)
+```
+
+This model had about a 13.7% error rate, or 7 out of 51, error rate on training data, but error rates on out of sample predictions is much more telling of model quality.
+
+```{r}
+# tests the model on training data
+
+# produces the predicted probabilities for the training data
+probs = predict(log.state.mixed, type = 'response')
+# creeates a vecotr of TRUE values the length of the training data
+preds = rep(TRUE, nrow(state.class))
+# replaces TRUE with FALSE where the predicted probability of TRUE is less than 0.5
+preds[probs < 0.5] = FALSE
+# creates a confustion matrix for the training data
+log.state.conf.mat = table(preds, y_state$clinton_win)
+# converts the units in the confusion matrix from number of states to proportion of states
+log.state.conf.mat / nrow(state.class)
+```
+
+Performing 5-fold cross validation using the model specified above yields a 16% mis-classification rate, with 3x more false negatives than false positives. This suggests the model is biased against predicting Clinton victories. To determine if the 16% error rate is good, I compared it to the baseline of predicting all observations as the modal outcome of the election outcomes in the 50 states plus DC. Clinton won 20 states and DC to the error rate of predicting the modal outcome is 21/51, or about 41%. This means the 2 variable model is an improvement over simply predicting the modal outcome.
+
+```{r}
+# this following block creates a function that performs k-folds cross validation on the classification models in glm
+
+# takes in a dataframe WHOSE FIRST COLUMN MUST BE THE DEPENDENDENT VARIABLE, a formula, the number of folds to use, and the family argument for the glm function (for logistic regression, input binomial)
+glm_cv = function(data, formula, folds, mod_type){
+  
+  # sets a random seed for reproducibility
+  set.seed(1071)
+  
+  # creates an empty vectors to hold the number of false positives and negatives, and the true positives and negatives for each of the k-folds
+  false_pos = c()
+  false_neg = c()
+  true_pos = c()
+  true_neg = c()
+  
+  # creates the variable k equal to folds, because it is easier to type
+  k = folds
+  
+  # starts a loop that goes from one to k
+  for (i in 1:k){
+    
+    # creates a column of the indices between 1 and the last index of the input dataframe, sampled randomly without replacement, and of length number of rows divided by k and rounded to the nearest integer
+    test = sample(1:nrow(data), round(nrow(data) / k) ,rep = F)
+    # fits a model on the input data withholding the test data
+    mod.temp = glm(formula, family = mod_type, data = data[-test,])
+    # predicts the probabilities of the testing data set with the just fit model
+    probs = predict(mod.temp, newdata = data[test, -1], type = 'response')
+    # creeates a vecotr of TRUE values the length of the testing data
+    preds = rep(TRUE, round(nrow(data) / k))
+    # replaces TRUE with FALSE where the predicted probability of TRUE is less than 0.5
+    preds[probs < 0.5] = FALSE
+    # creates a confustion matrix for the test data
+    confusion_matrix = table(preds, data[test, 1])
+    
+    # appends the true postives, etc to their corresponding vectors
+    false_pos = append(false_pos, confusion_matrix[2,1])
+    false_neg = append(false_neg, confusion_matrix[1,2])
+    true_pos = append(true_pos, confusion_matrix[2,2])
+    true_neg = append(true_neg, confusion_matrix[1,1])
+  }
+  # binds all the vectors by column, so each row is holds the number of true negatives etc for each fold
+  mod.cv = cbind(true_neg, false_neg, false_pos, true_pos)
+  
+  # sums up each column (type of prediction like true positive) and divides that by the total number of prediction and overwrites the variable its named for
+  true_neg = sum(mod.cv[,1]) / sum(mod.cv[,])
+  false_neg = sum(mod.cv[,2]) / sum(mod.cv[,])
+  false_pos = sum(mod.cv[,3]) / sum(mod.cv[,])
+  true_pos = sum(mod.cv[,4]) / sum(mod.cv[,])
+  
+  # creates a row of the predicted FALSES
+  pred_false = cbind(true_neg, false_neg)
+  # creates a row of predicted TRUES
+  pred_true = cbind(false_pos, true_pos)
+  # binds them together to produce a confusion matrix
+  cv.confusiom.matrix = rbind(pred_false, pred_true)
+  # changes the row and column names of the confusion matrix for easier interpretability
+  colnames(cv.confusiom.matrix) = c('FALSE', 'TRUE')
+  row.names(cv.confusiom.matrix) = c('FALSE', 'TRUE')
+  
+  # returns the confusion matrix of the cross validated predictions
+  return(cv.confusiom.matrix)
+}
+
+# performs k-forlds cross validation on the mixed stepwise selected model at the state level
+print(glm_cv(state.class, log.state.mixed$formula, 5, 'binomial'))
+```
+
+Because there are only so many states, it is impossible to estimate the significance for more than a couple of the features in the ACS on electoral outcomes. More observations are required, which is why I created a data set for the county level data as well.
+
+### **ii. County Level**
+
+In the model estimated on all the features in the county data set, a significant portion of the independent variables are significant at the 95% significance level and even more are not. To keep only variables I am fairly certain affect election outcome, I used both forwards and backwards variable selection. I decided to not use best subset selection because the number of calculations that would require with almost 30 independent variables is very high.
+
+```{r}
+# creates a variable for whether Clinton won a county or not
+county_clinton_win = y_county[,3]
+# combines the variable above with the independent variables at the county level
+county.class = cbind(county_clinton_win, X_county[,-1])
+# estimates a logistic regression model for the county level with all variables
+suppressWarnings((log.county.full = glm(county_clinton_win~., family = 'binomial', data = county.class)))
+# summarizes the model
+summary(log.county.full)
+```
+
+In the model selected with backwards selection, 6 independent variables have been eliminated from the full model. In addition, some interesting relationships show up. Some are difficult to develop explanations for and some come with plausible explanations. Some are counter-intuitive.
+
+The most glaring example of a counter-intuitive relationship is that increases in the black population in a state is associated with a decrease in likelihood of a Clinton victory in that county, despite the exit polls suggesting black voters overwhelmingly supporting Clinton. This is an illustration that correlation does not imply correlation. This may be caused by the South having a large population of black people, but still leaning heavily Republican overall. A similar story can be told for the negative coefficient for Native Americans. They reside disproportionately in the heavily Republican Midwest. A higher proportion of white people in a county is associated with a decrease in the likelihood of a Clinton victory according to the model. This is consistent with white people voting for Republicans more often than for Democrats.
+
+Secretary Clinton's chances of victory increased in counties with high unemployment rates and child poverty rates. They also increased in counties with higher incomes per capita. This suggests to me she won poorer counties and richer counties, suggesting she did well where people were making more money (which correlates with higher education levels and urbanization) and where people were hurting economically. This may mean she did well with those worst off and best off.
+
+A pair of variables that positively affected Clinton's chances of winning a county, according to the model, are taking public transport and walking to work. These are modes of commuting most common in urban areas and seem to be a proxy of the degree of urbanization of a county.
+
+```{r}
+# performs backwards stepwise regression for variable selection
+suppressWarnings((log.county.backwards = step(log.county.full, trace = 0)))
+summary(log.county.backwards)
+```
+
+I evaluated this model using 5-fold cross validation and used the error rate of predicting the modal outcome as the baseline comparison rate. That baseline is about 15.6% in my data set missing a couple counties/boroughs. The mis-classification rate of the model selected with backwards selection is about 6.8%, which is less than half the baseline error rate. The rate of false negatives is about 3.9% compared to 2.8% rate of false positives, suggesting the possibility the model is slightly biased towards predicting a Clinton loss.
+
+```{r}
+sum(county.class$county_clinton_win == T)/length(county.class$county_clinton_win)
+```
+
+
+```{r}
+# performs k-forlds cross validation on the backwards stepwise selected model at the county level
+print(suppressWarnings((glm_cv(county.class, log.county.backwards$formula, 5, 'binomial'))))
+```
+
+The model selected by forwards selection has many of the same variables as the model selected using backwards selection and the direction of coefficients remains the same. However, without the variables for the proportion of black and Hispanic people (it is possible other factors are causing this change, but I assume it is these because they are racial variables)in a county, the z-value for the coefficient of white jumps up to -16.068, which is really large.
+
+This model has a negligible decrease in the mis-classification rate, but it has 5 fewer variables than the model selected with backwards selection. Because it is roughly as accurate and more parsimonious, I prefer this model to the one selected with backwards selection.
+
+```{r}
+# creates an empty model for forwards step-wise regression
+null.mod <- glm(county_clinton_win ~ 1, family = 'binomial', data = county.class)
+# performs forward stepwise regression for variable selection
+suppressWarnings((log.county.forwards = step(null.mod, scope = list(lower=formula(null.mod), upper = formula(log.county.full)), direction='forward', trace = 0)))
+summary(log.county.forwards)
+```
+
+
+```{r}
+# performs k-forlds cross validation on the forwards stepwise selected model at the county level
+print(suppressWarnings((glm_cv(county.class, log.county.forwards$formula, 5, 'binomial'))))
+```
+
+# **IV. Closing Thoughts**
+
+I enjoyed working on a problem of election prediction, as it was how I first became interested in data. Although the logistic regressions outperformed simply guessing the modal outcome in the 2016 election, I believe they would not generalize well if trying to predict the 2020 election, as they would over fit to the 2016 election. I would include a couple cycles to get more observations and get models less sensitive to the idiosyncrasies of the 2016 election. I would also use the ACS data from the year of the election for better estimates of the effects of demographic factors on the election; even though I would have to rely on the 2019 ACS to make predictions for 2020.
+
+Additionally, I would need a way to capture polls in a model. Using the 2 variable state level model reveals why that might be the case. The model had a few large misses *on the training data set!* Notably, all but Florida could be considered large misses for the model. 
+
+Below: Mis-Classified States from the training set estimation for the Mixed Selection State Level Model
+```{r}
+state %>%
+  filter(preds != y_state$clinton_win) %>%
+    select(State)
+```
+
+A model with more observations (from, say, 3 election cycles) could have enough degrees of freedom to allow for more variables and a better model. But, Colorado, Oregon, and Washington were put in the same cluster as Idaho, Kansas, Oklahoma and Utah based on the ACS data, despite having very different election outcomes. That may be a function of my particular number of clusters and random seed, but it may reflect that there is something more to voting patterns than only ACS data can predict, despite its usefulness. Accounting for demographic data and poll results would likely be an improvement over just relying on demographic data. 
+
+This project was quite enjoyable and generated several further avenues of inquiry. I hope to find the time to work on them. Thanks for reading.
